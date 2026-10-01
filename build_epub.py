@@ -260,9 +260,15 @@ def cat_rank(c):
     return 99
 
 
+COMM_ORDER = []   # default commentators in the defaults document's order
+
+
 def comm_rank(name):
-    """The app's commRank: Rashi, Tosafot, Steinsaltz lead; the rest follow."""
+    """With a defaults order: its position, the rest after it. Without one:
+    the app's commRank (Rashi, Tosafot, Steinsaltz lead; the rest follow)."""
     lc = str(name).lower()
+    if COMM_ORDER:
+        return COMM_ORDER.index(lc) if lc in COMM_ORDER else len(COMM_ORDER)
     if lc.startswith("rashi"):
         return 0
     if lc.startswith("tosafot") or lc.startswith("tosfot"):
@@ -303,7 +309,7 @@ def push_segs(out, ref, he, en):
 def source_segments(src, label_hint=""):
     """-> (segments [{ref, heRef, he, en}], label, heLabel)"""
     if not src:
-        return [], "", ""
+        return [], "", "", []
     pieces = src if isinstance(src, list) else [src]
     segs = []
     for p in pieces:
@@ -368,6 +374,7 @@ class Book:
         self.inc_he = o.get("hebrew", True)
         self.inc_en = o.get("english", True)
         self.inc_src = o.get("include_source", True)
+        COMM_ORDER[:] = [str(x).lower() for x in (o.get("commentator_order") or [])]
         self.tlang = o.get("translation_language", "English")
         self.he = HeRefs(b.get("he_titles"))
         self.notes = {k: str(v).strip() for k, v in (b.get("notes") or {}).items() if str(v).strip()}
@@ -663,7 +670,7 @@ def gather(bundle):
         if have_src:
             emit_whole_source(section_notes=True)
         for cat in cat_order:
-            comms = sorted(tree[cat], key=lambda c: -len(tree[cat][c]))
+            comms = sorted(tree[cat], key=lambda c: ((comm_rank(c) if COMM_ORDER else 0), -len(tree[cat][c])))
             ca = next_id()
             ct = bk.hdr_text(cat, CAT_HE.get(cat.lower(), ""))
             toc.append({"level": 1, "text": ct, "anchor": ca})
@@ -1672,6 +1679,9 @@ def bundle_from_workdir(wd, store=None):
         sel = selection(wd, groups)
         b = {"ref": fb["ref"], "source": fb.get("source"), "links": selected_links(fb, sel)}
     b["options"] = load_json(wd_path(wd, "options.json"), {})
+    if fb.get("mode") != "search":
+        # the book lists the default commentators in the defaults document's order
+        b["options"]["commentator_order"] = [g["comm"] for g in groups if g["def"] is not None]
     b["translations"] = load_translations(wd, store)
     b["notes"] = load_json(wd_path(wd, "notes.json"), {})
     return b
