@@ -12,6 +12,8 @@ The linked texts and commentators ticked by default for each type of text. Withi
 | Rashba | Rashba on <Tractate> | 1235–1310 |
 | Meiri | Meiri on <Tractate> | 1249–1315 |
 | Penei Yehoshua | Penei Yehoshua on <Tractate> | 1680–1756 |
+| Ben Yehoyada | Ben Yehoyada on <Tractate> | 1835–1909 |
+| Benayahu | Benayahu on <Tractate> | 1835–1909 |
 | Steinsaltz | Steinsaltz on <Tractate> | 1937–2020 |
 
 ## Mishnah
