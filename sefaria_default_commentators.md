@@ -1,11 +1,12 @@
 # Default linked texts and commentators
 
-The linked texts and commentators ticked by default for each type of text. Within each list the commentators are in chronological order. The second column gives Sefaria's exact title for each work.
+The linked texts and commentators ticked by default for each type of text. Within each list the commentators are in chronological order, except that in the Talmud list Steinsaltz comes first. The second column gives Sefaria's exact title for each work.
 
 ## Talmud Bavli
 
 | Commentator | Sefaria name | Lived |
 |---|---|---|
+| Steinsaltz | Steinsaltz on <Tractate> | 1937–2020 |
 | Rashi | Rashi on <Tractate> | 1040–1105 |
 | Tosafot | Tosafot on <Tractate> | 12th–14th c. |
 | Ramban | Chiddushei Ramban on <Tractate> | 1194–1270 |
@@ -14,7 +15,6 @@ The linked texts and commentators ticked by default for each type of text. Withi
 | Penei Yehoshua | Penei Yehoshua on <Tractate> | 1680–1756 |
 | Ben Yehoyada | Ben Yehoyada on <Tractate> | 1835–1909 |
 | Benayahu | Benayahu on <Tractate> | 1835–1909 |
-| Steinsaltz | Steinsaltz on <Tractate> | 1937–2020 |
 
 ## Mishnah
 
