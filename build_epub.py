@@ -40,6 +40,7 @@ BUNDLE KEYS (all optional except what the mode needs)
   search         { query, sections: [ {ref, heRef?, he, en} ] }   (mode "search")
 """
 
+import difflib
 import html
 import json
 import os
@@ -105,6 +106,12 @@ def strip_html(s):
     p.feed(str(s))
     p.close()
     return re.sub(r"\s+", " ", "".join(p.out)).strip()
+
+
+def has_english(en):
+    """English counts only if it has Latin letters: some English slots hold a
+    Hebrew placeholder (Steinsaltz on Berakhot 2a has "בדיקה")."""
+    return bool(re.search(r"[A-Za-z]", strip_html(en)))
 
 
 def as_text(v):
@@ -1503,7 +1510,7 @@ def inventory(wd, defaults_path=None):
                                     "he": l["commentator_he"], "n": 0, "chars": 0, "noen": 0, "def": None})
         g["n"] += 1
         g["chars"] += len(strip_html(l["he"]))
-        if strip_html(l["he"]) and not strip_html(l["en"]):
+        if strip_html(l["he"]) and not has_english(l["en"]):
             g["noen"] += 1
         d = default_match(l, patterns, book)
         if d is not None and (g["def"] is None or d < g["def"]):
@@ -1581,7 +1588,7 @@ def trans_groups(wd, lang, store=None, include_english=False, defaults_path=None
     opts = load_json(wd_path(wd, "options.json"), {})
     t = load_translations(wd, store)
     english = lang.strip().lower() in ("english", "en")
-    need = lambda he, en, ref: strip_html(he) and not trans_done(t, ref, lang) and not (english and strip_html(en) and not include_english)
+    need = lambda he, en, ref: strip_html(he) and not trans_done(t, ref, lang) and not (english and has_english(en) and not include_english)
     out = []
     if opts.get("include_source", True) and fb.get("source"):
         items = [(s["ref"], strip_html(s["he"])) for s in fb["source"]["segments"] if need(s["he"], s["en"], s["ref"])]
@@ -1783,9 +1790,609 @@ def build_from_bundle(bundle, out):
     return 0 if not problems else 1
 
 
+# --------------------------------------------------------------------------
+# Browse -- the app's Browse (table-of-contents walk), one level per call
+# --------------------------------------------------------------------------
+# Stateless: every call walks Sefaria's live contents from the top along a
+# path ("Talmud > Bavli > Seder Moed > Shabbat > By daf") and prints only the
+# level it lands on. Each option leads either further in ("browse: <path>") or
+# to a reference, which ends the walk.
+INDEX_API = API + "/api/index"
+TITLES_API = API + "/api/index/titles"
+NAME_API = API + "/api/name/"
+SEP = " > "
+ALIYOT = ["Rishon", "Sheni", "Shlishi", "Revi'i", "Chamishi", "Shishi", "Shevi'i"]
+HE_ALIYOT = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שביעי"]
+STRUCT_HE = {"parasha": "לפי פרשה", "parshiot": "לפי פרשה", "daf": "לפי דף", "essay": "לפי מאמר",
+             "tikkunim": "לפי תיקון", "gate": "לפי שער", "topic": "לפי נושא", "chapters": "לפי פרק"}
+SECNAME_HE = {"chapter": "לפי פרק", "perek": "לפי פרק", "daf": "לפי דף", "siman": "לפי סימן",
+              "mishnah": "לפי משנה", "halakhah": "לפי הלכה", "volume": "לפי כרך",
+              "paragraph": "לפי פסקה", "verse": "לפי פסוק", "section": "לפי חלק"}
+
+
+def cached_json(wd, name, url, max_age=86400):
+    """A large, slow-changing Sefaria file, kept a day in the work folder."""
+    path = wd_path(wd, name)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age:
+        j = load_json(path, None)
+        if j is not None:
+            return j
+    j = http_json(url)
+    if j is None:
+        j = load_json(path, None)               # a stale copy beats nothing
+        if j is None:
+            raise SystemExit("Couldn't load " + url)
+        return j
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(j, f, ensure_ascii=False)
+    return j
+
+
+def node_en(n):                                 # nodeEn
+    if n.get("title"):
+        return n["title"]
+    if n.get("category"):
+        return n["category"]
+    t = [x for x in n.get("titles") or [] if x.get("lang") == "en"]
+    t = [x for x in t if x.get("primary")] or t
+    return t[0]["text"] if t else (n.get("key") or "section")
+
+
+def node_he(n):                                 # nodeHe
+    if n.get("heTitle"):
+        return n["heTitle"]
+    if n.get("heCategory"):
+        return n["heCategory"]
+    t = [x for x in n.get("titles") or [] if x.get("lang") == "he"]
+    t = [x for x in t if x.get("primary")] or t
+    return t[0]["text"] if t else ""
+
+
+def is_comm_book(b):
+    return str(b.get("dependence") or "").lower() == "commentary"
+
+
+def is_comm_cat(c):
+    """Rishonim / Acharonim / Modern Commentary on ..., and any "Commentary"."""
+    return (str(c.get("searchRoot") or "").lower().endswith("commentary")
+            or re.search(r"commentary", str(c.get("category") or ""), re.I) is not None)
+
+
+def has_primary(node):
+    for ch in node.get("contents") or []:
+        if "contents" in ch:
+            if not is_comm_cat(ch) and has_primary(ch):
+                return True
+        elif ch.get("title") and not is_comm_book(ch):
+            return True
+    return False
+
+
+def primary_contents(node):
+    """A contents node's children, primary texts only: commentary categories,
+    commentary books and categories left empty are dropped."""
+    out = []
+    for ch in node.get("contents") or []:
+        if "contents" in ch:
+            if not is_comm_cat(ch) and has_primary(ch):
+                out.append(ch)
+        elif ch.get("title") and not is_comm_book(ch):
+            out.append(ch)
+    # Inside Midrash, the aggadic subcategory reads above the halakhic one.
+    if str(node.get("category") or "").lower() == "midrash":
+        ai = next((i for i, c in enumerate(out) if re.search("aggad", node_en(c), re.I)), -1)
+        hi = next((i for i, c in enumerate(out) if re.search("hala[ck]h", node_en(c), re.I)), -1)
+        if ai > -1 and hi > -1 and hi < ai:
+            out.insert(hi, out.pop(ai))
+    return out
+
+
+def b_opt(label, he, path, go):
+    return {"label": label, "he": he or "", "kind": "browse", "path": path + [label], "go": go}
+
+
+def r_opt(label, he, ref, fetch=None, whole=False):
+    return {"label": label, "he": he or "", "kind": "ref", "ref": ref,
+            "fetch": fetch or 'fetch "%s"' % ref, "whole": whole}
+
+
+def level(path, options, note=""):
+    return {"path": path, "options": options, "note": note}
+
+
+def final(path, ref):
+    return level(path, [r_opt(ref, "", ref)])
+
+
+def send_text(o):
+    return "browse: " + SEP.join(o["path"]) if o["kind"] == "browse" else o["ref"]
+
+
+def cat_level(node, path):
+    opts = []
+    for ch in primary_contents(node):
+        if "contents" in ch:
+            opts.append(b_opt(node_en(ch), node_he(ch), path,
+                              lambda ch=ch, p=path + [node_en(ch)]: cat_level(ch, p)))
+        else:
+            opts.append(b_opt(ch["title"], ch.get("heTitle"), path,
+                              lambda t=ch["title"], p=path + [ch["title"]]: book_level(t, p)))
+    return level(path, opts)
+
+
+def alt_structs(rec):                           # altStructsFrom
+    alts = (rec or {}).get("alt_structs") or (rec or {}).get("alts") or {}
+    return [(k, v["nodes"]) for k, v in alts.items() if isinstance(v, dict) and v.get("nodes")]
+
+
+def is_daf_schema(schema):                      # isDafSchema
+    return bool(schema and not schema.get("nodes") and (schema.get("addressTypes") or [None])[0] == "Talmud")
+
+
+def daf_from_ref(ref):                          # dafFromRef
+    m = re.search(r"\s(\d+[ab])(?::|\s*-|$)", str(ref))
+    return m.group(1) if m else None
+
+
+def daf_label_from(start, i):                   # dafLabelFrom
+    m = re.match(r"^(\d+)\s*([ab])$", str(start))
+    s = (int(m.group(1)) * 2 + (m.group(2) == "b") + i) if m else (4 + i)
+    return "%d%s" % (s // 2, "ab"[s % 2])
+
+
+def book_level(title, path):
+    rec = http_json(V2_INDEX_API + enc(title))
+    if not isinstance(rec, dict) or not rec.get("schema"):
+        return final(path, title)
+    schema, structs = rec["schema"], alt_structs(rec)
+    # A tractate: by perek (Sefaria's chapter structure) or by daf.
+    if is_daf_schema(schema):
+        opts = []
+        ch = next((s for s in structs if re.search("chapter", s[0], re.I)), structs[0] if structs else None)
+        if ch and all(n.get("refs") for n in ch[1]):
+            opts.append(b_opt("By perek", "לפי פרק", path, lambda: perek_list(title, ch[1], path + ["By perek"])))
+        opts.append(b_opt("By daf", "לפי דף", path, lambda: daf_level(title, schema, path + ["By daf"])))
+        return level(path, opts)
+    # Anything else: the book's own schema and its alternate structures, as
+    # the site offers them (default_struct first, exclude_structs hidden).
+    rows = []
+    ex = [str(s).lower() for s in rec.get("exclude_structs") or []]
+    if "schema" not in ex:
+        sn = str((schema.get("sectionNames") or [""])[0])
+        rows.append(("By " + sn.lower() if sn else "Contents", SECNAME_HE.get(sn.lower(), ""), None))
+    for name, nodes in structs:
+        rows.append(("By " + name.lower(), STRUCT_HE.get(name.lower(), ""), (name, nodes)))
+    ds = rec.get("default_struct")
+    i = next((i for i, r in enumerate(rows) if r[2] and r[2][0] == ds), -1)
+    if i > 0:
+        rows.insert(0, rows.pop(i))
+    if not rows:
+        return default_schema(title, schema, path)
+    opts = []
+    for label, he, st in rows:
+        p = path + [label]
+        if st:
+            opts.append(b_opt(label, he, path, lambda st=st, p=p: alt_level(title, st[1], st[0], p)))
+        else:
+            opts.append(b_opt(label, he, path, lambda p=p: default_schema(title, schema, p)))
+    return level(path, opts)
+
+
+def perek_list(title, nodes, path):
+    opts = []
+    for i, n in enumerate(nodes):
+        en = node_en(n)
+        label = en if en and en != "section" else "Chapter %d" % (i + 1)
+        opts.append(b_opt(label, node_he(n), path,
+                          lambda n=n, i=i, p=path + [label]: perek_level(title, n, i + 1, p)))
+    return level(path, opts)
+
+
+def perek_level(title, node, num, path):
+    """One chapter: the whole chapter, then its pages (a page shared with the
+    next chapter is Sefaria's partial ref, e.g. "Shabbat 20b:1-4")."""
+    refs = node["refs"]
+    first, last = daf_from_ref(refs[0]), daf_from_ref(refs[-1])
+    rng = title + " " + first + ("-" + last if last and last != first else "") if first else title
+    opts = [r_opt("Whole chapter — " + rng, "", "%s (chapter %d)" % (rng, num),
+                  fetch='fetch "%s" --chapter %d' % (title, num), whole=True)]
+    opts += [r_opt(daf_from_ref(r) or r, "", r) for r in refs]
+    return level(path, opts, "a is the front of the page, b the back")
+
+
+def amud_refs(prefix):
+    """Every amud that has text, from Sefaria's live shape (index 0 is 1a)."""
+    j = http_json(SHAPE_API + enc(prefix))
+    first = j[0] if isinstance(j, list) and j else j
+    if isinstance(first, dict) and first.get("isComplex") and isinstance(first.get("chapters"), list):
+        first = next((c for c in first["chapters"] if isinstance(c, dict) and c.get("title") == prefix), None)
+    ch = first.get("chapters") if isinstance(first, dict) else None
+    if not isinstance(ch, list):
+        return None
+    return ["%s %d%s" % (prefix, i // 2 + 1, "ab"[i % 2]) for i, c in enumerate(ch)
+            if (len(c) if isinstance(c, list) else c)]
+
+
+def daf_level(prefix, node, path):
+    refs = amud_refs(prefix)
+    if not refs:                                # the app's fallback: 2a on
+        n = (node.get("lengths") or [180])[0]
+        refs = ["%s %d%s" % (prefix, 2 + i // 2, "ab"[i % 2]) for i in range(n)]
+    return level(path, [r_opt(r[len(prefix) + 1:], "", r) for r in refs],
+                 "a is the front of the page, b the back")
+
+
+def alt_node_en(n):
+    if n.get("default"):
+        return "(main text)"
+    t = node_en(n)
+    return t if t and t != "section" else "(main text)"
+
+
+def alt_level(title, nodes, sname, path):       # renderAltNodes
+    d = next((n for n in nodes if n and n.get("default") and (n.get("refs") or n.get("wholeRef"))), None)
+    opts = alt_leaf(title, d, sname) if d else []
+    for n in nodes:
+        if not n or n is d:
+            continue
+        label, p = alt_node_en(n), path + [alt_node_en(n)]
+        he = "" if n.get("default") else node_he(n)
+        if n.get("nodes"):
+            opts.append(b_opt(label, he, path, lambda n=n, p=p: alt_level(title, n["nodes"], sname, p)))
+        else:
+            opts.append(b_opt(label, he, path, lambda n=n, p=p: level(p, alt_leaf(title, n, sname))))
+    return level(path, opts)
+
+
+def alt_leaf(title, node, sname):               # appendAltLeaf
+    opts = []
+    whole = node.get("wholeRef") or ""
+    if whole:
+        nm = alt_node_en(node)
+        opts.append(r_opt("Whole " + (str(sname or "section").lower() if nm == "(main text)" else nm)
+                          + " — " + whole, "", whole, whole=True))
+    refs = node.get("refs") or []
+    at = node.get("addressTypes") or []
+    if node.get("startingAddress") or "Talmud" in at or "Folio" in at:
+        for i, r in enumerate(refs):
+            label = daf_label_from(node["startingAddress"], i) if node.get("startingAddress") else (daf_from_ref(r) or str(i + 1))
+            opts.append(r_opt(label, "", r))
+        return opts
+    aliyot = len(refs) == 7 and re.match("parash", str(sname or ""), re.I)
+    for i, r in enumerate(refs):
+        opts.append(r_opt(ALIYOT[i] + " · " + r if aliyot else r, HE_ALIYOT[i] if aliyot else "", r))
+    return opts
+
+
+def default_schema(title, schema, path):
+    if schema.get("nodes"):
+        return schema_nodes(title, schema, title, path)
+    return jagged(title, schema, path)
+
+
+def jdepth(node):
+    return node.get("depth") or len(node.get("sectionNames") or []) or 1
+
+
+def schema_nodes(title, node, prefix, path):    # renderSchemaNodes
+    opts = []
+    for ch in node.get("nodes") or []:
+        label = "(main text)" if ch.get("default") else node_en(ch)
+        he = "" if ch.get("default") else node_he(ch)
+        cp = prefix if ch.get("default") else prefix + ", " + node_en(ch)
+        p = path + [label]
+        if ch.get("nodes"):
+            opts.append(b_opt(label, he, path, lambda ch=ch, cp=cp, p=p: schema_nodes(title, ch, cp, p)))
+        elif jdepth(ch) == 1:
+            opts.append(r_opt(label, he, cp))
+        else:
+            opts.append(b_opt(label, he, path, lambda ch=ch, cp=cp, p=p: jagged(cp, ch, p)))
+    return level(path, opts) if opts else final(path, prefix)
+
+
+def shape_len(title):                           # shapeLen
+    j = http_json(SHAPE_API + enc(title))
+    first = j[0] if isinstance(j, list) and j else j
+    if not isinstance(first, dict):
+        return None
+    if first.get("isComplex") and isinstance(first.get("chapters"), list):
+        first = next((c for c in first["chapters"] if isinstance(c, dict) and c.get("title") == title), None)
+        if not first:
+            return None
+    if isinstance(first.get("chapters"), int):
+        return first["chapters"] or None
+    return first.get("length") or (len(first["chapters"]) if isinstance(first.get("chapters"), list) else None) or None
+
+
+def fetch_count(ref):                           # fetchCount
+    j = texts_json(ref)
+    n = max(len(j["he"]) if j and isinstance(j.get("he"), list) else 0,
+            len(j["text"]) if j and isinstance(j.get("text"), list) else 0)
+    return max(n, shape_count_for(ref) or 0) or None
+
+
+def ref_join(prefix, secs):
+    return prefix + " " + ":".join(str(s) for s in secs)
+
+
+def number_opts(prefix, node, secs, count, path):
+    depth = len(node.get("sectionNames") or []) or 1
+    opts = []
+    for i in range(1, count + 1):
+        s = secs + [i]
+        if len(s) >= depth:
+            opts.append(r_opt(str(i), "", ref_join(prefix, s)))
+        else:
+            opts.append(b_opt(str(i), "", path, lambda s=s, p=path + [str(i)]: pick_number(prefix, node, s, p)))
+    return opts
+
+
+def jagged(prefix, node, path):                 # renderJagged
+    if jdepth(node) == 1:
+        return final(path, prefix)
+    if (node.get("addressTypes") or ["Integer"])[0] == "Talmud":
+        return daf_level(prefix, node, path)
+    sname = str((node.get("sectionNames") or ["section"])[0]).lower()
+    n = shape_len(prefix) or (node.get("lengths") or [None])[0] or fetch_count(prefix)
+    if not n:
+        return final(path, prefix)
+    return level(path, number_opts(prefix, node, [], n, path), "pick a " + sname)
+
+
+def pick_number(prefix, node, secs, path):      # pickNumber
+    cur = ref_join(prefix, secs)
+    nxt = str((node.get("sectionNames") or [])[len(secs)] if len(node.get("sectionNames") or []) > len(secs) else "part").lower()
+    c = fetch_count(cur)
+    opts = [r_opt("All of " + cur, "", cur, whole=True)]
+    if c:
+        opts += number_opts(prefix, node, secs, c, path)
+    return level(path, opts, "all of it, or narrow to a " + nxt)
+
+
+def find_opt(lvl, part):
+    p = part.strip().casefold()
+    for o in lvl["options"]:
+        if p in (o["label"].casefold(), o["he"].casefold()) or (o["kind"] == "ref" and p == o["ref"].casefold()):
+            return o
+    return None
+
+
+def browse_walk(wd, parts):
+    """Walk the live contents along parts; levels with one option are passed
+    through (and may or may not be named in the path)."""
+    toc = cached_json(wd, "toc_cache.json", INDEX_API)
+    root = cat_level({"contents": toc}, [])
+    if parts and not find_opt(root, parts[0]):
+        # a bare book title: start from its place in the contents
+        want = parts[0].casefold()
+        hit = []
+
+        def look(nodes):
+            for n in nodes:
+                if "contents" in n:
+                    look(n["contents"])
+                elif want in (str(n.get("title", "")).casefold(), str(n.get("heTitle", "")).casefold()):
+                    hit.append(n)
+        look(toc)
+        if hit:
+            parts = list(hit[0].get("categories") or []) + [hit[0]["title"]] + parts[1:]
+    lvl, skipped, i = root, [], 0
+    while True:
+        while len(lvl["options"]) == 1 and lvl["options"][0]["kind"] == "browse":
+            o = lvl["options"][0]
+            skipped.append(o["label"])
+            if i < len(parts) and find_opt(lvl, parts[i]):
+                i += 1
+            lvl = o["go"]()
+        if i >= len(parts):
+            return lvl, skipped, None
+        o = find_opt(lvl, parts[i])
+        if not o:
+            return lvl, skipped, parts[i]
+        i += 1
+        if o["kind"] == "ref":
+            return level(lvl["path"], [o]), skipped, None
+        lvl = o["go"]()
+
+
+def jq(s):
+    return json.dumps(s, ensure_ascii=False)
+
+
+WIDGET_HEAD = ('<style>#w button{margin:2px;padding:6px 9px;border:1px solid #aaa;border-radius:6px;'
+               'background:#f4f4f4;color:#222;font:inherit;cursor:pointer}#w div{margin:3px 0}'
+               '@media(prefers-color-scheme:dark){#w button{background:#333;color:#eee;border-color:#666}}'
+               '</style><div id=w></div><script>const w=document.getElementById("w"),'
+               'B=(l,t,p=w)=>{const b=document.createElement("button");b.textContent=l;'
+               'b.onclick=()=>sendPrompt(t);p.append(b)};')
+DAF_TOK = re.compile(r"^(.*\S)\s(\d+[ab](?::\d+(?:-\d+)?)?)$")
+
+
+def daf_js(opts):
+    """Talmud pages: one row per daf with its a / b buttons. Data is a token
+    string; runs of whole amudim are written as ranges ("2a-157b")."""
+    m = [DAF_TOK.match(o["ref"]) if o["kind"] == "ref" else None for o in opts]
+    if not opts or not all(m) or len({x.group(1) for x in m}) != 1:
+        return None
+    if any(daf_from_ref(o["ref"]) != o["label"] and o["label"] != x.group(2) for o, x in zip(opts, m)):
+        return None
+    side = lambda t: int(t[:-1]) * 2 + (t[-1] == "b")
+    toks, run = [], []
+    for x in m:
+        t = x.group(2)
+        if ":" not in t and run and side(t) == side(run[-1]) + 1:
+            run.append(t)
+            continue
+        if run:
+            toks.append(run[0] + ("-" + run[-1] if len(run) > 1 else ""))
+        run = [] if ":" in t else [t]
+        if ":" in t:
+            toks.append(t)
+    if run:
+        toks.append(run[0] + ("-" + run[-1] if len(run) > 1 else ""))
+    return ('const A=%s,S=x=>parseInt(x)*2+(x[x.length-1]=="b");let r,d;'
+            'for(const t of %s.split(" ")){const m=t.match(/^(\\d+[ab])-(\\d+[ab])$/),k=m?[]:[t];'
+            'if(m)for(let s=S(m[1]);s<=S(m[2]);s++)k.push((s>>1)+"ab"[s&1]);'
+            'for(const x of k){const n=parseInt(x);if(n!==d){d=n;r=document.createElement("div");'
+            'r.append(n+" ");w.append(r)}B(x.replace(/^\\d+/,""),A+x,r)}}'
+            % (jq(m[0].group(1) + " "), jq(" ".join(toks))))
+
+
+def num_js(opts):
+    """1..N, each sending a common prefix plus its number."""
+    if not opts or [o["label"] for o in opts] != [str(i) for i in range(1, len(opts) + 1)]:
+        return None
+    sends = [send_text(o) for o in opts]
+    a = sends[0][:-1]
+    if not all(s == a + o["label"] for s, o in zip(sends, opts)):
+        return None
+    return "const A=%s;for(let i=1;i<=%d;i++)B(i,A+i);" % (jq(a), len(opts))
+
+
+def list_js(path, opts):
+    """[label, hebrew, what it sends]; the last is left out when it is just
+    this level's path plus the label."""
+    p = "browse: " + "".join(x + SEP for x in path)
+    rows = []
+    for o in opts:
+        s = send_text(o)
+        row = [o["label"], o["he"]] + ([] if s == p + o["label"] else [s])
+        while row and row[-1] == "":
+            row.pop()
+        rows.append(row)
+    return ('const P=%s;for(const[l,h,t]of %s)B(h?l+" · "+h:l,t||P+l);'
+            % (jq(p), json.dumps(rows, ensure_ascii=False, separators=(",", ":"))))
+
+
+def widget(lvl):
+    opts = lvl["options"]
+    whole = [o for o in opts if o.get("whole")]
+    rest = [o for o in opts if not o.get("whole")]
+    js = "".join("B(%s,%s);" % (jq(o["label"]), jq(send_text(o))) for o in whole)
+    js += daf_js(rest) or num_js(rest) or list_js(lvl["path"], rest)
+    return WIDGET_HEAD + js + "</script>"
+
+
+def browse(wd, where):
+    where = re.sub(r"^\s*browse:\s*", "", where or "", flags=re.I).strip()
+    parts = [p.strip() for p in where.split(">") if p.strip()] if where else []
+    lvl, skipped, missing = browse_walk(wd, parts)
+    opts = lvl["options"]
+    if missing:
+        print("NOT FOUND: %r is not an option here; showing this level instead." % missing)
+    print("LEVEL: " + (SEP.join(lvl["path"]) or "Top"))
+    for s in skipped:
+        print("SKIPPED: %s (the only option)" % s)
+    if len(opts) == 1 and opts[0]["kind"] == "ref":
+        print("FINAL: " + opts[0]["ref"])
+        print("FETCH: " + opts[0]["fetch"])
+        return 0
+    if not opts:
+        print("Nothing to browse here.")
+        return 1
+    show = "buttons" if len(opts) <= 4 else "grid"
+    print("SHOW: %s (%d option%s)%s" % (show, len(opts), "" if len(opts) == 1 else "s",
+                                        (" - " + lvl["note"]) if lvl.get("note") else ""))
+    for i, o in enumerate(opts, 1):
+        print(" %d. %s%s -> %s%s" % (i, o["label"], (" | " + o["he"]) if o["he"] else "", send_text(o),
+                                     ("   [" + o["fetch"] + "]") if o["kind"] == "ref" and "--chapter" in o["fetch"] else ""))
+    if show == "grid":
+        html_w = widget(lvl)
+        print("WIDGET (%d bytes):" % len(html_w.encode("utf-8")))
+        print(html_w)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Resolve -- a typed source (English or Hebrew, even misspelled) to a ref
+# --------------------------------------------------------------------------
+RESOLVE_ADDR = re.compile(r"^(.*?[^\d\s:.,\-–])[\s,.]*(\d+[ab]?(?:[:.]\d+[ab]?)*(?:\s*[-–]\s*\d+[ab]?(?:[:.]\d+[ab]?)*)?)$")
+
+
+def name_api(q, refs_only=False):
+    j = http_json(NAME_API + enc(q) + "?limit=10" + ("&type=ref" if refs_only else ""))
+    return j if isinstance(j, dict) else {}
+
+
+def resolve(wd, text):
+    """Sefaria's name API first; then near spellings of the title (Sefaria's
+    own completions and the closest of its title variants) with the address
+    put back, kept only when Sefaria accepts the result as a reference."""
+    q = re.sub(r"\s+", " ", text or "").strip()
+    chap = re.match(r"^(.*?)\s*\(chapter (\d+)\)$", q, re.I)
+    if chap:
+        q = chap.group(1)
+    if not q:
+        raise SystemExit("resolve needs some text.")
+    found = []
+    j = name_api(q)
+    if j.get("is_ref") and j.get("ref"):
+        found = [j]
+    else:
+        splits = []
+        m = RESOLVE_ADDR.match(q)
+        if m:
+            splits.append((m.group(1).strip(" ,."), m.group(2)))
+        else:                                   # Hebrew numerals: try 0-2 short trailing words
+            toks = q.split(" ")
+            for k in (0, 1, 2):
+                if len(toks) > k and all(len(t) <= 4 for t in toks[len(toks) - k:]):
+                    splits.append((" ".join(toks[:len(toks) - k]), " ".join(toks[len(toks) - k:])))
+        books = (cached_json(wd, "titles_cache.json", TITLES_API) or {}).get("books") or []
+        he_books = []
+
+        def look(nodes):
+            for n in nodes:
+                if "contents" in n:
+                    look(n["contents"])
+                elif n.get("heTitle"):
+                    he_books.append(n["heTitle"])
+        look(cached_json(wd, "toc_cache.json", INDEX_API))
+        cands = []
+        for title, addr in splits:
+            pool = he_books if re.search("[֐-׿]", title) else books
+            close = lambda t: difflib.SequenceMatcher(None, title.casefold(), str(t).casefold()).ratio() >= 0.6
+            names = [c["key"] for c in name_api(title, True).get("completion_objects") or []
+                     if c.get("type") == "ref" and isinstance(c.get("key"), str) and close(c.get("title"))]
+            names += difflib.get_close_matches(title, pool, n=6, cutoff=0.6)
+            for nm in names:
+                c = (nm + " " + addr).strip()
+                if c not in cands:
+                    cands.append(c)
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            checked = list(ex.map(name_api, cands[:16]))
+        seen = set()
+        for c in checked:
+            if c.get("is_ref") and c.get("ref") and c["ref"] not in seen:
+                seen.add(c["ref"])
+                found.append(c)
+    if not found:
+        print("NONE: Sefaria doesn't recognise %r as a source." % text)
+        return 1
+    if len(found) == 1:
+        f = found[0]
+        if chap:
+            print("EXACT: %s (chapter %s)" % (f["ref"], chap.group(2)))
+            print('FETCH: fetch "%s" --chapter %s' % (f.get("index") or f["ref"], chap.group(2)))
+        elif f.get("is_book"):
+            print("BOOK: " + f["ref"])
+            print("NEXT: browse " + f["ref"])
+        else:
+            print("EXACT: " + f["ref"])
+            print('FETCH: fetch "%s"' % f["ref"])
+        return 0
+    print("CANDIDATES:")
+    for i, f in enumerate(found[:5], 1):
+        print(" %d. %s%s" % (i, f["ref"], "  (whole book)" if f.get("is_book") else ""))
+    return 0
+
+
 USAGE = """build_epub.py -- fetch from Sefaria and build a Kindle EPUB like the Sefaria Links app.
 
 Work-folder commands (default folder /home/claude/book, change with --dir):
+  browse [PATH]                               Sefaria's contents, one level: browse,
+                                              browse "Talmud > Bavli", browse Shabbat
+  resolve TEXT                                a typed source -> exact ref or candidates
   fetch REF [--chapter N] [--pages REF ...]   fetch source + every linked text; list them
   show                                        list the linked texts again (numbered)
   select [--add N ...] [--remove N ...] [--only N ...] [--all] [--none]
@@ -1974,6 +2581,12 @@ def main(argv):
         fetch_search_texts(wd, rest[0], rest[1:], scope)
         return 0
 
+    if cmd == "browse":
+        return browse(wd, " ".join(rest))
+
+    if cmd == "resolve":
+        return resolve(wd, " ".join(rest))
+
     if cmd == "build":
         out = rest[0] if rest else "/mnt/user-data/outputs/"
         return build_from_bundle(bundle_from_workdir(wd, store), out)
@@ -1981,7 +2594,7 @@ def main(argv):
 
 
 COMMANDS = ["fetch", "show", "select", "options", "trans-list", "trans-get", "trans-add",
-            "trans-export", "note", "search", "search-book", "build", "bundle"]
+            "trans-export", "note", "search", "search-book", "build", "bundle", "browse", "resolve"]
 
 
 if __name__ == "__main__":
