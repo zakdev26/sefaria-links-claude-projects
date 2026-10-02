@@ -67,7 +67,7 @@ Below, `B` stands for `python3 /home/claude/build_epub.py`.
 
 ## 2. Agree the selection
 
-`fetch` prints a numbered list of what Sefaria links to the source. Your defaults are ticked `[x]` first, in chronological order; everything else follows, unticked, by category.
+`fetch` prints a numbered list of what Sefaria links to the source. Your defaults are ticked `[x]` first, in the order of `sefaria_default_commentators.md`; everything else follows, unticked, by category.
 
 **Before writing to the user,** run `B trans-list --lang English`. It lists only the chosen texts that have **no English on Sefaria**; anything with Sefaria English is never a translation candidate.
 
