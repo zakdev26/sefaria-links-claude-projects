@@ -1887,6 +1887,20 @@ def primary_contents(node):
     return out
 
 
+def browse_data(wd, out):
+    """The primary-text contents tree for the navigator widget, as compact
+    arrays: [name, hebrew, children] for a category, [title, hebrew] for a
+    book. Same filtering and order as browse."""
+    def tree(node):
+        return [[node_en(c), node_he(c), tree(c)] if "contents" in c else [c["title"], c.get("heTitle") or ""]
+                for c in primary_contents(node)]
+    data = tree({"contents": cached_json(wd, "toc_cache.json", INDEX_API, max_age=0)})
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+    print("Wrote %s (%d bytes)" % (out, os.path.getsize(out)))
+    return 0
+
+
 def b_opt(label, he, path, go):
     return {"label": label, "he": he or "", "kind": "browse", "path": path + [label], "go": go}
 
@@ -2393,6 +2407,7 @@ Work-folder commands (default folder /home/claude/book, change with --dir):
   browse [PATH]                               Sefaria's contents, one level: browse,
                                               browse "Talmud > Bavli", browse Shabbat
   resolve TEXT                                a typed source -> exact ref or candidates
+  browse-data [OUT]                           contents file for the navigator widget
   fetch REF [--chapter N] [--pages REF ...]   fetch source + every linked text; list them
   show                                        list the linked texts again (numbered)
   select [--add N ...] [--remove N ...] [--only N ...] [--all] [--none]
@@ -2587,6 +2602,9 @@ def main(argv):
     if cmd == "resolve":
         return resolve(wd, " ".join(rest))
 
+    if cmd == "browse-data":
+        return browse_data(wd, rest[0] if rest else "browse_toc.json")
+
     if cmd == "build":
         out = rest[0] if rest else "/mnt/user-data/outputs/"
         return build_from_bundle(bundle_from_workdir(wd, store), out)
@@ -2594,7 +2612,7 @@ def main(argv):
 
 
 COMMANDS = ["fetch", "show", "select", "options", "trans-list", "trans-get", "trans-add",
-            "trans-export", "note", "search", "search-book", "build", "bundle", "browse", "resolve"]
+            "trans-export", "note", "search", "search-book", "build", "bundle", "browse", "resolve", "browse-data"]
 
 
 if __name__ == "__main__":
