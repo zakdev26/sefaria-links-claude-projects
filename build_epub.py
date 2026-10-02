@@ -1887,17 +1887,106 @@ def primary_contents(node):
     return out
 
 
+NAV_KEYS = ("default", "sectionNames", "addressTypes", "depth", "lengths", "refs", "wholeRef", "startingAddress")
+
+
+def nav_node(n):
+    """A schema or alt-structure node, cut to what the navigator reads."""
+    out = {k: n[k] for k in NAV_KEYS if n.get(k)}
+    en, he = node_en(n), node_he(n)
+    if en and en != "section":
+        out["title"] = en
+    if he:
+        out["heTitle"] = he
+    if n.get("nodes"):
+        out["nodes"] = [nav_node(c) for c in n["nodes"]]
+    return out
+
+
+def nav_book(title):
+    """One book for the navigator: its schema, alternate structures and the
+    live shape (counts per section, keyed by each leaf's full title)."""
+    rec = http_json(V2_INDEX_API + enc(title))
+    if not isinstance(rec, dict) or not rec.get("schema"):
+        return None
+    alts = rec.get("alt_structs") or rec.get("alts") or {}
+    out = {"schema": nav_node(rec["schema"]),
+           "alts": {k: {"nodes": [nav_node(n) for n in v["nodes"]]}
+                    for k, v in alts.items() if isinstance(v, dict) and v.get("nodes")}}
+    for k in ("default_struct", "exclude_structs"):
+        if rec.get(k):
+            out[k] = rec[k]
+    shape = {}
+    j = http_json(SHAPE_API + enc(title))
+    for f in (j if isinstance(j, list) else [j]):
+        if not isinstance(f, dict):
+            continue
+        for leaf in (f["chapters"] if f.get("isComplex") and isinstance(f.get("chapters"), list) else [f]):
+            if isinstance(leaf, dict) and leaf.get("title") and leaf.get("chapters") is not None:
+                shape[leaf["title"]] = leaf["chapters"]
+    return {"i": out, "s": shape}
+
+
 def browse_data(wd, out):
-    """The primary-text contents tree for the navigator widget, as compact
-    arrays: [name, hebrew, children] for a category, [title, hebrew] for a
-    book. Same filtering and order as browse."""
+    """Data for the navigator widget, served from the repo so the widget
+    never has to reach Sefaria: OUT (browse_toc.json) is the primary-text
+    contents tree as compact arrays -- [name, hebrew, children] for a
+    category, [title, hebrew, id] for a book -- and browse_books/<id>.json
+    beside it holds each book's structure (nav_book)."""
+    ids = {}
+
     def tree(node):
-        return [[node_en(c), node_he(c), tree(c)] if "contents" in c else [c["title"], c.get("heTitle") or ""]
-                for c in primary_contents(node)]
+        rows = []
+        for c in primary_contents(node):
+            if "contents" in c:
+                rows.append([node_en(c), node_he(c), tree(c)])
+            else:
+                rows.append([c["title"], c.get("heTitle") or "", ids.setdefault(c["title"], len(ids))])
+        return rows
     data = tree({"contents": cached_json(wd, "toc_cache.json", INDEX_API, max_age=0)})
     with open(out, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-    print("Wrote %s (%d bytes)" % (out, os.path.getsize(out)))
+    print("Wrote %s (%d bytes, %d books)" % (out, os.path.getsize(out), len(ids)))
+    bdir = os.path.join(os.path.dirname(os.path.abspath(out)), "browse_books")
+    os.makedirs(bdir, exist_ok=True)
+    for old in os.listdir(bdir):
+        os.remove(os.path.join(bdir, old))
+    done, failed, total = [0], [], [0]
+
+    def one(item):
+        title, i = item
+        bk = nav_book(title)
+        done[0] += 1
+        if done[0] % 100 == 0:
+            status("%d / %d books" % (done[0], len(ids)))
+        if not bk:
+            failed.append(title)
+            return
+        path = os.path.join(bdir, "%d.json" % i)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(bk, f, ensure_ascii=False, separators=(",", ":"))
+        total[0] += os.path.getsize(path)
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(one, ids.items()))
+    print("Wrote %d book files to %s (%d bytes)" % (len(ids) - len(failed), bdir, total[0]))
+    if failed:
+        # Contents entries Sefaria has no book behind ("No book named ...")
+        # can't be opened anywhere, so the navigator leaves them out.
+        gone = set(failed)
+
+        def prune(rows):
+            out = []
+            for r in rows:
+                if isinstance(r[2], list):
+                    kids = prune(r[2])
+                    if kids:
+                        out.append([r[0], r[1], kids])
+                elif r[0] not in gone:
+                    out.append(r)
+            return out
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(prune(data), f, ensure_ascii=False, separators=(",", ":"))
+        print("Left out (no book on Sefaria): " + ", ".join(sorted(failed)))
     return 0
 
 
