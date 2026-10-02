@@ -1580,6 +1580,12 @@ def trans_done(t, ref, lang):
     return not had or had == lang.strip().lower()
 
 
+# Never offered for an English translation: Sefaria's "Steinsaltz on ..." has
+# no English because his English is the Talmud's own English (the William
+# Davidson edition), already in the book as the source's English.
+NOT_FOR_ENGLISH = ("steinsaltz",)
+
+
 def trans_groups(wd, lang, store=None, include_english=False, defaults_path=None):
     """What needs translating: the source first, section by section, then one
     group per commentator -- defaults in the document's order, then the rest."""
@@ -1597,6 +1603,8 @@ def trans_groups(wd, lang, store=None, include_english=False, defaults_path=None
     chosen = set(sel.get("groups") or [])
     for g in groups:
         if g["key"] not in chosen:
+            continue
+        if english and not include_english and g["comm"].strip().lower() in NOT_FOR_ENGLISH:
             continue
         items = [(l["ref"], strip_html(l["he"])) for l in fb["links"]
                  if l["category"] + "|" + l["commentator"] == g["key"] and need(l["he"], l["en"], l["ref"])]

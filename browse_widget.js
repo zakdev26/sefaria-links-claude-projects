@@ -24,21 +24,32 @@
 #snav .cr{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:0 0 8px;font-size:13px;color:var(--mut)}
 #snav .cr a{color:var(--acc);cursor:pointer;text-decoration:none}
 #snav .bk{border:1px solid var(--bd);background:var(--btn);color:var(--fg);border-radius:6px;padding:3px 9px;margin-right:4px;cursor:pointer;font:inherit}
-#snav .ls,#snav .gd{display:flex;flex-wrap:wrap;gap:6px}
-#snav button.o{border:1px solid var(--bd);background:var(--btn);color:var(--fg);border-radius:8px;padding:7px 11px;
-  min-height:38px;cursor:pointer;font:inherit;text-align:start}
-#snav .gd button.o{min-width:44px;text-align:center;padding:7px 6px}
-#snav button.o:hover{border-color:var(--acc)}
-#snav button.o .h{display:block;font-size:13px;color:var(--mut);direction:rtl}
-#snav button.w{width:100%;margin:0 0 8px;font-weight:600}
-#snav .rows{columns:112px;column-gap:10px}
+#snav .ls{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));grid-auto-rows:1fr;gap:6px}
+#snav .gd{display:grid;grid-template-columns:repeat(auto-fill,minmax(50px,1fr));gap:6px}
+#snav button.o{--c:var(--acc);border:1px solid var(--bd);border-left:4px solid var(--c);background:var(--btn);color:var(--fg);
+  border-radius:8px;padding:7px 10px;min-height:42px;cursor:pointer;font:inherit;text-align:start;
+  display:flex;flex-direction:column;justify-content:center}
+#snav .gd button.o,#snav .row button.o{border-left-width:1px;border-bottom:3px solid var(--c);align-items:center;padding:7px 0}
+#snav button.o:hover{border-color:var(--c)}
+#snav button.o .h{font-size:13px;color:var(--mut);direction:rtl;align-self:flex-end}
+#snav button.w{width:100%;margin:0 0 8px;font-weight:600;background:color-mix(in srgb,var(--c) 16%,var(--btn))}
+#snav .rows{columns:120px;column-gap:10px}
 #snav .row{display:flex;align-items:center;gap:6px;margin:0 0 5px;break-inside:avoid}
 #snav .row b{min-width:34px;text-align:end;color:var(--mut);font-weight:500}
+#snav .row button.o{width:44px;min-height:40px}
 #snav .nt{font-size:13px;color:var(--mut);margin:0 0 8px}
 #snav .sent{color:var(--ok);font-weight:600;margin:8px 0 0}
 #snav button.done{border-color:var(--ok);outline:2px solid var(--ok)}`;
   document.head.appendChild(css);
 
+  // Sefaria's own category colours: a stripe on each button, and the colour
+  // of everything inside that part of the library.
+  const COLORS = { "Tanakh": "#004E5F", "Mishnah": "#5A99B7", "Talmud": "#CCB479", "Midrash": "#5D956F",
+    "Halakhah": "#802F3E", "Kabbalah": "#594176", "Liturgy": "#AB4E66", "Jewish Thought": "#7F85A9",
+    "Tosefta": "#00827F", "Chasidut": "#97B386", "Musar": "#7C416F", "Responsa": "#CB6158",
+    "Second Temple": "#C6A7B4", "Reference": "#D4896C" };
+
+  const short = t => String(t).replace(/^Chapter (\d+);\s*/, "$1. ");   // "Chapter 2; BaMeh Madlikin" -> "2. BaMeh Madlikin"
   const el = (tag, cls, txt) => {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -339,8 +350,8 @@
     }
     shown.forEach((x, k) => {
       if (k) cr.appendChild(document.createTextNode("›"));
-      if (k < shown.length - 1 || msg) { const a = el("a", "", x.s.label); a.onclick = () => back(x.i); cr.appendChild(a); }
-      else cr.appendChild(el("span", "", x.s.label));
+      if (k < shown.length - 1 || msg) { const a = el("a", "", short(x.s.label)); a.onclick = () => back(x.i); cr.appendChild(a); }
+      else cr.appendChild(el("span", "", short(x.s.label)));
     });
     box.appendChild(cr);
     if (msg) {
@@ -355,15 +366,18 @@
       }
       return;
     }
+    const top = stack.length === 1, corpus = stack[1] && COLORS[stack[1].label];
+    const tint = b => { if (corpus) b.style.setProperty("--c", corpus); return b; };
     if (page.note) box.appendChild(el("div", "nt", page.note));
     for (const w of page.whole || []) {
-      const b = el("button", "o w", w.label);
+      const b = tint(el("button", "o w", w.label));
       b.onclick = () => send(w.ref, b);
       box.appendChild(b);
     }
     const items = page.items;
     const opt = (it, text) => {
-      const b = el("button", "o", text == null ? it.label : text);
+      const b = tint(el("button", "o", text == null ? short(it.label) : text));
+      if (top && COLORS[it.label]) b.style.setProperty("--c", COLORS[it.label]);
       if (it.he && text == null) b.appendChild(el("span", "h", it.he));
       b.onclick = () => it.ref ? send(it.ref, b) : go(it.label, it.next);
       return b;
@@ -373,12 +387,15 @@
     if (daf) {
       const rows = el("div", "rows");
       box.appendChild(rows);
-      let row = null, d = null;
+      let row = null, d = null, part = false;
       for (const it of items) {
-        const tok = (it.ref.match(/\s(\d+)([ab](?::[\d-]+)?)$/) || [, it.label, ""]);
+        const tok = (it.ref.match(/\s(\d+)([ab])(:[\d-]+)?$/) || [, it.label, "", ""]);
         if (tok[1] !== d) { d = tok[1]; row = el("div", "row"); row.appendChild(el("b", "", d)); rows.appendChild(row); }
-        row.appendChild(opt(it, tok[2] || it.label));
+        const b = opt(it, (tok[2] || it.label) + (tok[3] ? "*" : ""));
+        if (tok[3]) { part = true; b.title = it.ref; }
+        row.appendChild(b);
       }
+      if (part) box.appendChild(el("div", "nt", "* part of the page \u2014 the rest belongs to the next or previous chapter"));
       return;
     }
     const grid = items.every(it => it.label.length <= 4 && !it.he);
