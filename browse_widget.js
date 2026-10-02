@@ -3,9 +3,11 @@
 // choice (a reference) goes back to Claude, through sendPrompt.
 //
 // Loaded by a short snippet (see project_instructions_v5.md) into
-// <div id="snav" data-start="...">. The contents levels come from
-// browse_toc.json beside this file (made by `build_epub.py browse-data`);
-// a book's own structure is read live from Sefaria, as the app does.
+// <div id="snav" data-start="...">. Everything it shows comes from files
+// beside it, made by `build_epub.py browse-data`: browse_toc.json (the
+// contents) and browse_books/<id>.json (each book's structure and counts),
+// so the widget never has to reach Sefaria itself. Live Sefaria is only a
+// fallback for a book with no file.
 (function (srcUrl) {
   "use strict";
   const API = "https://www.sefaria.org/api/";
@@ -88,12 +90,35 @@
   const fin = (label, he, ref) => ({ label, he: he || "", ref });
   const finalPage = ref => ({ items: [fin(ref, "", ref)] });
 
+  // [name, he, children] is a category; [title, he, id] a book.
+  const isCat = k => Array.isArray(k[2]);
   function catPage(kids) {
     return {
-      items: kids.map(k => k.length === 3
+      items: kids.map(k => isCat(k)
         ? nav(k[0], k[1], () => catPage(k[2]))
-        : nav(k[0], k[1], () => bookPage(k[0])))
+        : nav(k[0], k[1], () => bookPage(k[0], k[2])))
     };
+  }
+
+  // A book: { i: its index record (schema, alts, ...), s: shape counts keyed
+  // by each leaf's full title }. Counts go into SHAPE for the pages below.
+  const SHAPE = {};
+  async function liveBook(title) {
+    const i = await getJSON(API + "v2/index/" + enc(title)), s = {};
+    try {
+      const j = await getJSON(API + "shape/" + enc(title));
+      for (const f of Array.isArray(j) ? j : [j])
+        for (const leaf of f && f.isComplex && Array.isArray(f.chapters) ? f.chapters : [f])
+          if (leaf && leaf.title && leaf.chapters != null) s[leaf.title] = leaf.chapters;
+    } catch (e) {}
+    return { i, s };
+  }
+  async function getBook(title, id) {
+    let bk = null;
+    if (id != null && BASE) { try { bk = await getJSON(BASE + "browse_books/" + id + ".json"); } catch (e) {} }
+    if (!bk) bk = await liveBook(title);
+    Object.assign(SHAPE, bk.s || {});
+    return bk.i;
   }
 
   const nodeEn = n => n.title || n.category || ((n.titles || []).find(x => x.lang === "en" && x.primary) || (n.titles || []).find(x => x.lang === "en") || {}).text || n.key || "section";
@@ -109,8 +134,8 @@
   const ALIYOT = ["Rishon", "Sheni", "Shlishi", "Revi'i", "Chamishi", "Shishi", "Shevi'i"];
   const HE_ALIYOT = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שביעי"];
 
-  async function bookPage(title) {
-    const rec = await getJSON(API + "v2/index/" + enc(title));
+  async function bookPage(title, id) {
+    const rec = await getBook(title, id);
     const schema = rec && rec.schema;
     if (!schema) return finalPage(title);
     const structs = altStructs(rec);
@@ -157,18 +182,14 @@
     };
   }
 
-  // Every amud that has text, from the live shape (index 0 is 1a); the app's
-  // 2a-on fallback if the shape can't be read.
-  async function dafPage(prefix, node) {
-    let refs = null;
-    try {
-      const j = await getJSON(API + "shape/" + enc(prefix));
-      let f = Array.isArray(j) ? j[0] : j;
-      if (f && f.isComplex && Array.isArray(f.chapters)) f = f.chapters.find(c => c && c.title === prefix);
-      if (f && Array.isArray(f.chapters))
-        refs = f.chapters.map((c, i) => (Array.isArray(c) ? c.length : c) ? prefix + " " + ((i >> 1) + 1) + "ab"[i & 1] : null).filter(Boolean);
-    } catch (e) {}
-    if (!refs || !refs.length) {
+  // Every amud that has text, from the shape (index 0 is 1a); the app's
+  // 2a-on fallback if there is no shape.
+  function dafPage(prefix, node) {
+    const ch = SHAPE[prefix];
+    let refs = Array.isArray(ch)
+      ? ch.map((c, i) => (Array.isArray(c) ? c.length : c) ? prefix + " " + ((i >> 1) + 1) + "ab"[i & 1] : null).filter(Boolean)
+      : [];
+    if (!refs.length) {
       const n = (node && node.lengths && node.lengths[0]) || 180;
       refs = Array.from({ length: n }, (_, i) => prefix + " " + (2 + (i >> 1)) + "ab"[i & 1]);
     }
@@ -187,8 +208,10 @@
     const pg = def ? altLeaf(title, def, sname) : { items: [], whole: [] };
     for (const n of nodes) {
       if (!n || n === def) continue;
-      pg.items.push(nav(altEn(n), n.default ? "" : nodeHe(n),
-        Array.isArray(n.nodes) && n.nodes.length ? () => altPage(title, n.nodes, sname) : () => altLeaf(title, n, sname)));
+      const he = n.default ? "" : nodeHe(n);
+      if (Array.isArray(n.nodes) && n.nodes.length) pg.items.push(nav(altEn(n), he, () => altPage(title, n.nodes, sname)));
+      else if (n.wholeRef && !(Array.isArray(n.refs) && n.refs.length)) pg.items.push(fin(altEn(n), he, n.wholeRef));  // one section: no page of its own
+      else pg.items.push(nav(altEn(n), he, () => altLeaf(title, n, sname)));
     }
     return pg;
   }
@@ -229,34 +252,12 @@
     return items.length ? { items } : finalPage(prefix);
   }
 
-  async function shapeLen(title) {
-    try {
-      const j = await getJSON(API + "shape/" + enc(title));
-      let f = Array.isArray(j) ? j[0] : j;
-      if (!f) return null;
-      if (f.isComplex && Array.isArray(f.chapters)) { f = f.chapters.find(c => c && c.title === title); if (!f) return null; }
-      if (typeof f.chapters === "number") return f.chapters || null;
-      return f.length || (Array.isArray(f.chapters) ? f.chapters.length : null) || null;
-    } catch (e) { return null; }
-  }
-
-  async function fetchCount(ref) {
-    let n = 0;
-    try {
-      const j = await getJSON(API + "texts/" + enc(ref) + "?context=0&commentary=0&pad=0");
-      n = Math.max(Array.isArray(j.he) ? j.he.length : 0, Array.isArray(j.text) ? j.text.length : 0);
-    } catch (e) {}
-    const m = String(ref).match(/^(.*\S)\s+(\d+)$/);   // shapeCountFor
-    if (m) {
-      try {
-        const j = await getJSON(API + "shape/" + enc(m[1]));
-        const f = Array.isArray(j) ? j[0] : j;
-        const c = f && Array.isArray(f.chapters) ? f.chapters[parseInt(m[2], 10) - 1] : null;
-        const k = Array.isArray(c) ? c.length : (typeof c === "number" ? c : 0);
-        if (k > n) n = k;
-      } catch (e) {}
-    }
-    return n || null;
+  // How many sections are under prefix + secs, from the shape: a list is
+  // counted, a plain number is the count (shapeLen / fetchCount in the app).
+  function countAt(prefix, secs) {
+    let v = SHAPE[prefix];
+    for (const n of secs) v = Array.isArray(v) ? v[n - 1] : undefined;
+    return Array.isArray(v) ? v.length : (typeof v === "number" ? v : null);
   }
 
   function numberItems(prefix, node, secs, count) {
@@ -267,19 +268,19 @@
     });
   }
 
-  async function jagged(prefix, node) {            // renderJagged
+  function jagged(prefix, node) {                  // renderJagged
     if (depthOf(node) === 1) return finalPage(prefix);
     if ((node.addressTypes || [])[0] === "Talmud") return dafPage(prefix, node);
     const sname = String((node.sectionNames || [])[0] || "section").toLowerCase();
-    const n = (await shapeLen(prefix)) || (node.lengths && node.lengths[0]) || (await fetchCount(prefix));
+    const n = countAt(prefix, []) || (node.lengths && node.lengths[0]);
     if (!n) return finalPage(prefix);
     return { items: numberItems(prefix, node, [], n), note: "pick a " + sname };
   }
 
-  async function pickNumber(prefix, node, secs) {  // pickNumber
+  function pickNumber(prefix, node, secs) {        // pickNumber
     const cur = refJoin(prefix, secs);
     const nxt = String((node.sectionNames || [])[secs.length] || "part").toLowerCase();
-    const c = await fetchCount(cur);
+    const c = countAt(prefix, secs);
     return { whole: [{ label: "All of " + cur, ref: cur }], items: c ? numberItems(prefix, node, secs, c) : [], note: "all of it, or narrow to a " + nxt };
   }
 
@@ -309,7 +310,7 @@
     try { page = await next(); } catch (e) { page = null; }
     clearTimeout(t);
     if (my !== busy) return false;
-    if (!page) { retry = () => go(label, next); draw(null, "Couldn’t reach Sefaria."); return false; }
+    if (!page) { retry = () => go(label, next); draw(null, "Couldn’t load this book."); return false; }
     // A level with only one way on is passed through, as Sefaria's site does.
     if (page.items.length === 1 && !(page.whole || []).length && page.items[0].next) {
       stack.push({ label, page, skip: true });
@@ -391,7 +392,7 @@
   async function start() {
     draw(null, "Loading…");
     let toc;
-    try { toc = await loadToc(); } catch (e) { stack = [{ label: "Sefaria" }]; retry = start; draw(null, "Couldn’t reach Sefaria."); return; }
+    try { toc = await loadToc(); } catch (e) { stack = [{ label: "Sefaria" }]; retry = start; draw(null, "Couldn’t load the contents."); return; }
     stack = [];
     const startAt = String(box.getAttribute("data-start") || "").trim();
     let parts = startAt ? startAt.split(">").map(s => s.trim()).filter(Boolean) : [];
@@ -399,7 +400,7 @@
       const want = parts[0].toLowerCase(), path = [];
       const look = (kids, trail) => {
         for (const k of kids) {
-          if (k.length === 3) { if (look(k[2], trail.concat(k[0]))) return true; }
+          if (isCat(k)) { if (look(k[2], trail.concat(k[0]))) return true; }
           else if (k[0].toLowerCase() === want || k[1] === parts[0]) { path.push(...trail, k[0]); return true; }
         }
         return false;
@@ -411,7 +412,8 @@
       const pg = stack[stack.length - 1].page;
       const it = pg.items.find(x => x.next && (x.label.toLowerCase() === parts[i].toLowerCase() || x.he === parts[i]));
       if (!it) {          // a level passed through by itself may be named too
-        if (stack.some(x => x.skip && x.label.toLowerCase() === parts[i].toLowerCase())) continue;
+        const here = stack[stack.length - 1].label.toLowerCase(), want = parts[i].toLowerCase();
+        if (here === want || stack.some(x => x.skip && x.label.toLowerCase() === want)) continue;
         break;
       }
       if (!(await go(it.label, it.next, i < parts.length - 1))) return;
